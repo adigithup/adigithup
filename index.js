@@ -8,16 +8,18 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
-const rateLimit = require('rate-limiter-flexible');
+const rateLimit = require('express-rate-limit');
 const path = require('path');
 const { createLogger, format, transports } = require('winston');
 const multer = require('multer');
 const csv = require('csv-parser');
 const XLSX = require('xlsx');
-const PassThrough = require('stream');
-const axios = require('axios');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode');
+const fs = require('fs');
+const { promisify } = require('util');
+const nodemailer = require('nodemailer');
 
 // Configuration
 require('dotenv').config();
@@ -45,19 +47,21 @@ const logger = createLogger({
   ]
 });
 
-// Rate limiting
-const limiter = rateLimit.createRateLimiter({
-  keyGenerator: (req) => req.ip,
-  points: 100,
-  duration: 60,
-  blockDuration: 60,
+// Pastikan folder logs ada
+if (!fs.existsSync('logs')) fs.mkdirSync('logs');
+
+// Rate limiting dengan express-rate-limit
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 menit
+  max: 100, // maksimal 100 request per IP
+  message: { error: 'Too many requests, please try again later.' }
 });
 
 // Middleware
 app.use(helmet());
 app.use(compression());
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
-app.use(limiter);
+app.use('/api', limiter); // hanya terapkan ke route API
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -69,52 +73,39 @@ app.use(session({
   saveUninitialized: false,
   store: MongoStore.create({
     mongoUrl: process.env.MONGODB_URI || 'mongodb://localhost:27017/whatsapp_dashboard',
-    ttl: 24 * 60 * 60 // 1 day
+    ttl: 24 * 60 * 60
   }),
   cookie: {
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
-    maxAge: 1000 * 60 * 60 * 24 // 1 day
+    maxAge: 1000 * 60 * 60 * 24
   }
 }));
 
 // MongoDB connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/whatsapp_dashboard', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => logger.info('MongoDB connected successfully'))
-.catch(err => logger.error('MongoDB connection error:', err));
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/whatsapp_dashboard')
+  .then(() => logger.info('MongoDB connected successfully'))
+  .catch(err => logger.error('MongoDB connection error:', err));
 
 // Socket.IO connection
 io.on('connection', (socket) => {
   logger.info(`User connected: ${socket.id}`);
-  
-  // Join dashboard room for real-time updates
   socket.on('join-dashboard', (userId) => {
     socket.join(`dashboard-${userId}`);
   });
-  
-  // WhatsApp session events
-  socket.on('whatsapp-event', (data) => {
-    io.emit('whatsapp-update', data);
-  });
-  
   socket.on('disconnect', () => {
     logger.info(`User disconnected: ${socket.id}`);
   });
 });
 
 // File upload middleware
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
-  }
-});
+const uploadDir = 'uploads/';
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+});
 const upload = multer({ storage: storage });
 
 // Models
@@ -134,6 +125,7 @@ const SessionSchema = new mongoose.Schema({
   phoneNumber: { type: String },
   qrCode: { type: String },
   pairingCode: { type: String },
+  authState: { type: Object },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -155,9 +147,9 @@ const Session = mongoose.model('Session', SessionSchema);
 const History = mongoose.model('History', HistorySchema);
 const Setting = mongoose.model('Setting', SettingSchema);
 
-// Authentication middleware
+// Authentication middleware (konsisten menggunakan req.session.user)
 const isAuthenticated = (req, res, next) => {
-  if (req.session.userId) {
+  if (req.session.user && req.session.user.id) {
     next();
   } else {
     res.status(401).json({ error: 'Unauthorized' });
@@ -172,27 +164,63 @@ const isAdmin = (req, res, next) => {
   }
 };
 
+// Helper: parse file (CSV/Excel)
+const parseFile = (filePath) => {
+  return new Promise((resolve, reject) => {
+    const ext = path.extname(filePath).toLowerCase();
+    let numbers = [];
+    if (ext === '.csv') {
+      fs.createReadStream(filePath)
+        .pipe(csv())
+        .on('data', (row) => {
+          const num = row.number || row.phone || Object.values(row)[0];
+          if (num) numbers.push(num.toString().trim());
+        })
+        .on('end', () => resolve(numbers))
+        .on('error', reject);
+    } else if (ext === '.xlsx' || ext === '.xls') {
+      const workbook = XLSX.readFile(filePath);
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const data = XLSX.utils.sheet_to_json(sheet);
+      numbers = data.map(row => row.number || row.phone || Object.values(row)[0]).filter(v => v).map(v => v.toString().trim());
+      resolve(numbers);
+    } else {
+      reject(new Error('Format file tidak didukung'));
+    }
+  });
+};
+
 // Routes
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Authentication routes
+// Registrasi user (untuk testing, sebaiknya dihapus di production)
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password, email } = req.body;
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({ username, password: hashedPassword, email });
+    await user.save();
+    res.json({ success: true, message: 'User registered' });
+  } catch (error) {
+    logger.error('Register error:', error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     const user = await User.findOne({ username });
-    
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    
     req.session.user = {
       id: user._id,
       username: user.username,
       role: user.role
     };
-    
     res.json({ success: true, user: req.session.user });
   } catch (error) {
     logger.error('Login error:', error);
@@ -205,27 +233,12 @@ app.post('/api/logout', (req, res) => {
   res.json({ success: true });
 });
 
-// Dashboard routes
-app.get('/api/dashboard/stats', isAuthenticated, async (req, res) => {
-  try {
-    const stats = {
-      totalUsers: await User.countDocuments(),
-      activeSessions: await Session.countDocuments({ status: 'active' }),
-      totalChecks: await History.countDocuments(),
-      systemStatus: await Setting.findOne({ key: 'system_status' })?.value || 'active'
-    };
-    res.json({ success: true, stats });
-  } catch (error) {
-    logger.error('Error getting dashboard stats:', error);
-    res.status(500).json({ error: 'Failed to get stats' });
-  }
-});
-
 // Session routes
 app.post('/api/whatsapp/session/create', isAuthenticated, async (req, res) => {
   try {
     const { name, type } = req.body;
-    const session = new Session({ name, type, status: 'pending' });
+    if (!name) return res.status(400).json({ error: 'Session name required' });
+    const session = new Session({ name, type: type || 'qr', status: 'pending' });
     await session.save();
     res.json({ success: true, sessionId: session._id });
   } catch (error) {
@@ -234,73 +247,88 @@ app.post('/api/whatsapp/session/create', isAuthenticated, async (req, res) => {
   }
 });
 
-app.post('/api/whatsapp/session/:sessionId/connect', isAuthenticated, async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    const session = await Session.findById(sessionId);
-    
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-    
-    // Generate QR code (simulated)
-    const qrCode = `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`;
-    
-    session.qrCode = qrCode;
-    session.status = 'pending';
-    await session.save();
-    
-    res.json({ success: true, qrCode });
-  } catch (error) {
-    logger.error('Error connecting session:', error);
-    res.status(500).json({ error: 'Failed to connect session' });
-  }
-});
+// WhatsApp session management
+const sessions = new Map();
 
-app.post('/api/whatsapp/session/:sessionId/pair', isAuthenticated, async (req, res) => {
+async function createWhatsAppSession(sessionId, io) {
   try {
-    const { sessionId } = req.params;
-    const { phoneNumber } = req.body;
-    const session = await Session.findById(sessionId);
-    
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-    
-    // Generate pairing code (simulated)
-    const pairingCode = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    session.pairingCode = pairingCode;
-    session.phoneNumber = phoneNumber;
-    session.status = 'pending';
-    await session.save();
-    
-    res.json({ success: true, pairingCode });
-  } catch (error) {
-    logger.error('Error pairing session:', error);
-    res.status(500).json({ error: 'Failed to pair session' });
-  }
-});
+    const sessionDoc = await Session.findById(sessionId);
+    if (!sessionDoc) throw new Error('Session not found');
 
-app.get('/api/whatsapp/session/:sessionId/status', isAuthenticated, async (req, res) => {
+    const authFolder = path.join(__dirname, 'sessions', sessionId);
+    if (!fs.existsSync(authFolder)) fs.mkdirSync(authFolder, { recursive: true });
+
+    const { state, saveState } = await useMultiFileAuthState(authFolder);
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: logger
+    });
+
+    sessions.set(sessionId, { sock, saveState });
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        const qrCode = await qrcode.toDataURL(qr);
+        await Session.findByIdAndUpdate(sessionId, { qrCode, status: 'pending' });
+        io.emit('whatsapp-update', { type: 'qr', sessionId, message: 'QR code generated' });
+      }
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        if (shouldReconnect) {
+          logger.info(`Reconnecting session ${sessionId}...`);
+          setTimeout(() => createWhatsAppSession(sessionId, io), 3000);
+        } else {
+          await Session.findByIdAndUpdate(sessionId, { status: 'inactive' });
+          io.emit('whatsapp-update', { type: 'disconnected', sessionId, message: 'Session logged out' });
+          sessions.delete(sessionId);
+        }
+      }
+      if (connection === 'open') {
+        await Session.findByIdAndUpdate(sessionId, { status: 'active', qrCode: null });
+        io.emit('whatsapp-update', { type: 'connected', sessionId, message: 'Session connected' });
+      }
+    });
+
+    sock.ev.on('messages.upsert', async (m) => {
+      // Bisa diisi jika perlu logging pesan
+    });
+
+    return sock;
+  } catch (error) {
+    logger.error('Error creating WhatsApp session:', error);
+    throw error;
+  }
+}
+
+app.post('/api/whatsapp/session/:sessionId/start', isAuthenticated, async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const session = await Session.findById(sessionId);
-    
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
+    const existing = sessions.get(sessionId);
+    if (existing) {
+      return res.json({ success: true, message: 'Session already running' });
     }
-    
-    res.json({ success: true, status: session.status });
+    await createWhatsAppSession(sessionId, io);
+    res.json({ success: true, message: 'Session started' });
   } catch (error) {
-    logger.error('Error getting session status:', error);
-    res.status(500).json({ error: 'Failed to get session status' });
+    logger.error('Error starting session:', error);
+    res.status(500).json({ error: 'Failed to start session' });
   }
 });
 
 app.delete('/api/whatsapp/session/:sessionId', isAuthenticated, async (req, res) => {
   try {
     const { sessionId } = req.params;
+    const sessionData = sessions.get(sessionId);
+    if (sessionData) {
+      sessionData.sock.end();
+      sessions.delete(sessionId);
+    }
+    // Hapus folder auth jika perlu
+    const authFolder = path.join(__dirname, 'sessions', sessionId);
+    if (fs.existsSync(authFolder)) fs.rmSync(authFolder, { recursive: true, force: true });
     await Session.findByIdAndDelete(sessionId);
     res.json({ success: true });
   } catch (error) {
@@ -309,134 +337,119 @@ app.delete('/api/whatsapp/session/:sessionId', isAuthenticated, async (req, res)
   }
 });
 
-// Check routes
+// Check routes dengan dukungan file
 app.post('/api/check/bio', isAuthenticated, upload.single('file'), async (req, res) => {
   try {
-    const { numbers, delay } = req.body;
-    const numbersArray = numbers ? numbers.split(',').map(n => n.trim()) : [];
-    
-    // Simulate check process
-    const results = numbersArray.map(num => ({
-      number: num,
-      status: Math.random() > 0.3 ? 'registered' : 'not_registered',
-      bio: Math.random() > 0.5 ? 'Sample bio text' : '',
-      metaBusiness: Math.random() > 0.7
-    }));
-    
-    // Save to history
-    const history = new History({
+    let numbersArray = [];
+    if (req.file) {
+      const filePath = req.file.path;
+      numbersArray = await parseFile(filePath);
+      fs.unlinkSync(filePath); // hapus file setelah parsing
+    } else if (req.body.numbers) {
+      numbersArray = req.body.numbers.split(',').map(n => n.trim());
+    } else {
+      return res.status(400).json({ error: 'No numbers provided' });
+    }
+
+    const delay = parseInt(req.body.delay) || 0;
+    const results = [];
+    const sessionEntry = sessions.values().next().value;
+    if (!sessionEntry) throw new Error('No active WhatsApp session');
+
+    for (const number of numbersArray) {
+      try {
+        const jid = number + '@s.whatsapp.net';
+        const info = await sessionEntry.sock.fetchStatus(jid);
+        results.push({
+          number,
+          status: 'registered',
+          bio: info.status || '',
+          lastUpdate: info.lastUpdate
+        });
+      } catch (error) {
+        results.push({ number, status: 'error', error: error.message });
+      }
+      if (delay > 0) await new Promise(r => setTimeout(r, delay));
+    }
+
+    await History.create({
       userId: req.session.user.id,
       action: 'check_bio',
       details: `Checked ${numbersArray.length} numbers`
     });
-    await history.save();
-    
     res.json({ success: true, results });
   } catch (error) {
     logger.error('Error checking bio:', error);
-    res.status(500).json({ error: 'Failed to check bio' });
+    res.status(500).json({ error: error.message || 'Failed to check bio' });
   }
 });
 
 app.post('/api/check/registered', isAuthenticated, upload.single('file'), async (req, res) => {
   try {
-    const { numbers, delay } = req.body;
-    const numbersArray = numbers ? numbers.split(',').map(n => n.trim()) : [];
-    
-    // Simulate check process
-    const results = numbersArray.map(num => ({
-      number: num,
-      registered: Math.random() > 0.3
-    }));
-    
-    // Save to history
-    const history = new History({
+    let numbersArray = [];
+    if (req.file) {
+      const filePath = req.file.path;
+      numbersArray = await parseFile(filePath);
+      fs.unlinkSync(filePath);
+    } else if (req.body.numbers) {
+      numbersArray = req.body.numbers.split(',').map(n => n.trim());
+    } else {
+      return res.status(400).json({ error: 'No numbers provided' });
+    }
+
+    const delay = parseInt(req.body.delay) || 0;
+    const results = [];
+    const sessionEntry = sessions.values().next().value;
+    if (!sessionEntry) throw new Error('No active WhatsApp session');
+
+    for (const number of numbersArray) {
+      try {
+        const jid = number + '@s.whatsapp.net';
+        const exists = await sessionEntry.sock.isOnWhatsApp(jid);
+        results.push({ number, registered: exists });
+      } catch (error) {
+        results.push({ number, registered: false, error: error.message });
+      }
+      if (delay > 0) await new Promise(r => setTimeout(r, delay));
+    }
+
+    await History.create({
       userId: req.session.user.id,
       action: 'check_registered',
       details: `Checked ${numbersArray.length} numbers`
     });
-    await history.save();
-    
     res.json({ success: true, results });
   } catch (error) {
     logger.error('Error checking registered numbers:', error);
-    res.status(500).json({ error: 'Failed to check registered numbers' });
+    res.status(500).json({ error: error.message || 'Failed to check registered numbers' });
   }
 });
 
-app.post('/api/check/range', isAuthenticated, async (req, res) => {
-  try {
-    const { prefix, start, end, delay } = req.body;
-    const numbers = [];
-    
-    for (let i = parseInt(start); i <= parseInt(end); i++) {
-      numbers.push(`${prefix}${i}`);
-    }
-    
-    // Simulate check process
-    const results = numbers.map(num => ({
-      number: num,
-      registered: Math.random() > 0.3
-    }));
-    
-    // Save to history
-    const history = new History({
-      userId: req.session.user.id,
-      action: 'check_range',
-      details: `Checked range ${start}-${end} with prefix ${prefix}`
-    });
-    await history.save();
-    
-    res.json({ success: true, results });
-  } catch (error) {
-    logger.error('Error checking range:', error);
-    res.status(500).json({ error: 'Failed to check range' });
-  }
-});
-
-app.post('/api/check/repe', isAuthenticated, upload.single('file'), async (req, res) => {
-  try {
-    const { numbers, delay } = req.body;
-    const numbersArray = numbers ? numbers.split(',').map(n => n.trim()) : [];
-    
-    // Simulate check process
-    const results = numbersArray.map(num => ({
-      number: num,
-      isRepe: Math.random() > 0.7,
-      registered: Math.random() > 0.3
-    }));
-    
-    // Save to history
-    const history = new History({
-      userId: req.session.user.id,
-      action: 'check_repe',
-      details: `Checked ${numbersArray.length} numbers for repe`
-    });
-    await history.save();
-    
-    res.json({ success: true, results });
-  } catch (error) {
-    logger.error('Error checking repe:', error);
-    res.status(500).json({ error: 'Failed to check repe' });
-  }
-});
-
-// Email routes
+// Email route (perbaikan nodemailer)
 app.post('/api/email/send', isAuthenticated, async (req, res) => {
   try {
-    const { to, subject, body, template } = req.body;
-    
-    // Simulate sending email
-    logger.info(`Email sent to ${to}: ${subject}`);
-    
-    // Save to history
-    const history = new History({
+    const { to, subject, body } = req.body;
+    if (!to || !subject || !body) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      }
+    });
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to,
+      subject,
+      text: body
+    });
+    await History.create({
       userId: req.session.user.id,
       action: 'send_email',
       details: `Email sent to ${to}`
     });
-    await history.save();
-    
     res.json({ success: true });
   } catch (error) {
     logger.error('Error sending email:', error);
@@ -444,62 +457,27 @@ app.post('/api/email/send', isAuthenticated, async (req, res) => {
   }
 });
 
-// Export routes
-app.get('/api/export/users', isAuthenticated, async (req, res) => {
+// Dashboard stats
+app.get('/api/dashboard/stats', isAuthenticated, async (req, res) => {
   try {
-    const users = await User.find({});
-    const filename = `users_${Date.now()}.json`;
-    
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
-    res.json(users);
+    const stats = {
+      totalUsers: await User.countDocuments(),
+      activeSessions: await Session.countDocuments({ status: 'active' }),
+      totalChecks: await History.countDocuments(),
+      systemStatus: (await Setting.findOne({ key: 'system_status' }))?.value || 'active'
+    };
+    res.json({ success: true, stats });
   } catch (error) {
-    logger.error('Error exporting users:', error);
-    res.status(500).json({ error: 'Failed to export users' });
+    logger.error('Error getting dashboard stats:', error);
+    res.status(500).json({ error: 'Failed to get stats' });
   }
 });
 
-app.get('/api/export/sessions', isAuthenticated, async (req, res) => {
-  try {
-    const sessions = await Session.find({});
-    const filename = `sessions_${Date.now()}.json`;
-    
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
-    res.json(sessions);
-  } catch (error) {
-    logger.error('Error exporting sessions:', error);
-    res.status(500).json({ error: 'Failed to export sessions' });
-  }
-});
-
-// Settings routes
-app.get('/api/settings', isAuthenticated, async (req, res) => {
-  try {
-    const settings = await Setting.find({});
-    res.json({ success: true, settings });
-  } catch (error) {
-    logger.error('Error getting settings:', error);
-    res.status(500).json({ error: 'Failed to get settings' });
-  }
-});
-
-app.post('/api/settings', isAuthenticated, async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    const setting = await Setting.findOneAndUpdate({ key }, { value }, { upsert: true });
-    res.json({ success: true, setting });
-  } catch (error) {
-    logger.error('Error updating setting:', error);
-    res.status(500).json({ error: 'Failed to update setting' });
-  }
-});
-
-// Monitoring routes
+// Monitoring
 app.get('/api/monitor/sessions', isAuthenticated, async (req, res) => {
   try {
-    const sessions = await Session.find({});
-    res.json({ success: true, sessions });
+    const sessionsList = await Session.find({});
+    res.json({ success: true, sessions: sessionsList });
   } catch (error) {
     logger.error('Error getting session monitoring data:', error);
     res.status(500).json({ error: 'Failed to get session monitoring data' });
@@ -527,32 +505,26 @@ app.use((err, req, res, next) => {
 
 // Start server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   logger.info(`Server running on port ${PORT}`);
-  
-  // Initialize default settings
-  Setting.findOneAndUpdate(
+  await Setting.findOneAndUpdate(
     { key: 'system_status' },
     { value: 'active' },
     { upsert: true }
-  ).then(() => {
-    logger.info('System status initialized');
-  }).catch(err => {
-    logger.error('Error initializing system status:', err);
-  });
+  );
+  logger.info('System status initialized');
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  logger.info('Received SIGINT. Graceful shutdown...');
+  logger.info('Graceful shutdown...');
   server.close(() => {
     logger.info('Server closed');
     process.exit(0);
   });
 });
-
 process.on('SIGTERM', () => {
-  logger.info('Received SIGTERM. Graceful shutdown...');
+  logger.info('Graceful shutdown...');
   server.close(() => {
     logger.info('Server closed');
     process.exit(0);
