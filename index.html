@@ -421,8 +421,27 @@
 
     <!-- Main Content -->
     <div class="main-content">
+        <!-- Login Form -->
+        <div id="login-container" class="login-container fade-in">
+            <div class="login-header">
+                <h1><i class="bi bi-whatsapp"></i> WhatsApp Dashboard</h1>
+                <p class="text-muted">Login to access your dashboard</p>
+            </div>
+            <form id="loginForm">
+                <div class="mb-3">
+                    <label for="username" class="form-label">Username</label>
+                    <input type="text" class="form-control" id="username" required>
+                </div>
+                <div class="mb-3">
+                    <label for="password" class="form-label">Password</label>
+                    <input type="password" class="form-control" id="password" required>
+                </div>
+                <button type="submit" class="btn btn-primary btn-login">Login</button>
+            </form>
+        </div>
+
         <!-- Dashboard Page -->
-        <div id="dashboard-page" class="page-content">
+        <div id="dashboard-page" class="page-content" style="display: none;">
             <h2 class="mb-4">Dashboard Overview</h2>
             
             <!-- Stats Cards -->
@@ -809,8 +828,6 @@
         document.addEventListener('DOMContentLoaded', () => {
             initializeApp();
             initializeCharts();
-            loadDashboardData();
-            loadSessions();
             setupEventListeners();
             setupSocketListeners();
         });
@@ -820,7 +837,7 @@
             // Check if user is logged in
             const token = localStorage.getItem('token');
             if (!token) {
-                window.location.href = '/login';
+                showLoginPage();
                 return;
             }
             
@@ -837,6 +854,18 @@
                 page.style.display = 'none';
             });
             document.getElementById(`${currentPage}-page`).style.display = 'block';
+            
+            // Load dashboard data
+            loadDashboardData();
+            loadSessions();
+        }
+        
+        // Show login page
+        function showLoginPage() {
+            document.getElementById('login-container').style.display = 'block';
+            document.querySelectorAll('.page-content').forEach(page => {
+                page.style.display = 'none';
+            });
         }
         
         // Initialize charts
@@ -968,9 +997,9 @@
                                     </div>
                                     <div>
                                         ${session.status === 'active' ? 
-                                            '<button class="btn btn-sm btn-danger" onclick="disconnectSession(\'' + session.id + '\')"><i class="bi bi-x-circle"></i></button>' : 
-                                            '<button class="btn btn-sm btn-success" onclick="connectSession(\'' + session.id + '\')"><i class="bi bi-link-45deg"></i></button>'}
-                                        <button class="btn btn-sm btn-danger ms-1" onclick="deleteSession(\'' + session.id + '\')"><i class="bi bi-trash"></i></button>
+                                            '<button class="btn btn-sm btn-danger" onclick="disconnectSession(\'' + session._id + '\')"><i class="bi bi-x-circle"></i></button>' : 
+                                            '<button class="btn btn-sm btn-success" onclick="connectSession(\'' + session._id + '\')"><i class="bi bi-link-45deg"></i></button>'}
+                                        <button class="btn btn-sm btn-danger ms-1" onclick="deleteSession(\'' + session._id + '\')"><i class="bi bi-trash"></i></button>
                                     </div>
                                 </div>
                                 <p class="card-text mt-2">
@@ -1007,7 +1036,7 @@
                     activityItem.className = 'activity-item';
                     activityItem.innerHTML = `
                         <div class="d-flex align-items-center">
-                            <i class="bi ${getActivityIcon(activity.type)} activity-icon"></i>
+                            <i class="bi ${getActivityIcon(activity.action)} activity-icon"></i>
                             <div class="flex-grow-1">
                                 <div>${activity.action} ${activity.details || ''}</div>
                                 <div class="activity-time">${new Date(activity.timestamp).toLocaleString()}</div>
@@ -1023,16 +1052,16 @@
         }
         
         // Get activity icon
-        function getActivityIcon(type) {
+        function getActivityIcon(action) {
             const icons = {
                 'login': 'bi-box-arrow-in-right',
                 'logout': 'bi-box-arrow-right',
                 'check': 'bi-search',
                 'email': 'bi-envelope',
                 'session': 'bi-phone',
-                'admin': 'bi-gear'
+                'send_email': 'bi-send'
             };
-            return icons[type] || 'bi-info-circle';
+            return icons[action] || 'bi-info-circle';
         }
         
         // Update charts
@@ -1063,6 +1092,12 @@
         
         // Setup event listeners
         function setupEventListeners() {
+            // Login form
+            document.getElementById('loginForm').addEventListener('submit', (e) => {
+                e.preventDefault();
+                login();
+            });
+            
             // Navigation
             document.querySelectorAll('.nav-link').forEach(link => {
                 link.addEventListener('click', (e) => {
@@ -1144,7 +1179,9 @@
         function setupSocketListeners() {
             socket.on('connect', () => {
                 console.log('Connected to server');
-                socket.emit('join-dashboard', localStorage.getItem('userId'));
+                if (localStorage.getItem('userId')) {
+                    socket.emit('join-dashboard', localStorage.getItem('userId'));
+                }
             });
             
             socket.on('whatsapp-update', (data) => {
@@ -1156,6 +1193,50 @@
                     loadSessions();
                 }
             });
+        }
+        
+        // Login function
+        async function login() {
+            try {
+                showLoading(true);
+                
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
+                
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ username, password })
+                });
+                
+                if (!response.ok) throw new Error('Login failed');
+                
+                const data = await response.json();
+                
+                localStorage.setItem('token', data.user.id);
+                localStorage.setItem('userId', data.user.id);
+                
+                showDashboard();
+            } catch (error) {
+                console.error('Login error:', error);
+                showNotification('Login failed. Please check your credentials.', 'error');
+            } finally {
+                showLoading(false);
+            }
+        }
+        
+        // Show dashboard
+        function showDashboard() {
+            document.getElementById('login-container').style.display = 'none';
+            document.querySelectorAll('.page-content').forEach(page => {
+                page.style.display = 'none';
+            });
+            document.getElementById('dashboard-page').style.display = 'block';
+            
+            loadDashboardData();
+            loadSessions();
         }
         
         // Switch page
@@ -1415,7 +1496,7 @@
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        ${generateMockResults(numbersArray)}
+                                        ${generateMockResults(numbersArray, type)}
                                     </tbody>
                                 </table>
                             </div>
@@ -1434,16 +1515,30 @@
         }
         
         // Generate mock results
-        function generateMockResults(numbers) {
+        function generateMockResults(numbers, type) {
             return numbers.map(num => {
-                const isRegistered = Math.random() > 0.3;
-                const status = isRegistered ? 'Registered' : 'Not Registered';
-                const details = isRegistered ? 'Bio: Sample bio text' : 'Number not found on WhatsApp';
+                let status, details;
+                
+                if (type === 'bio') {
+                    status = Math.random() > 0.3 ? 'Registered' : 'Not Registered';
+                    details = status === 'Registered' ? 
+                        `Bio: ${Math.random() > 0.5 ? 'Sample bio text' : ''}` : 
+                        'Number not found on WhatsApp';
+                } else if (type === 'registered') {
+                    status = Math.random() > 0.3 ? 'Registered' : 'Not Registered';
+                    details = status === 'Registered' ? 'Number found on WhatsApp' : 'Number not found';
+                } else if (type === 'range') {
+                    status = Math.random() > 0.3 ? 'Registered' : 'Not Registered';
+                    details = status === 'Registered' ? 'Number found' : 'Number not found';
+                } else if (type === 'repe') {
+                    status = Math.random() > 0.7 ? 'Repe' : 'Not Repe';
+                    details = status === 'Repe' ? 'Number is repe/cantik' : 'Number is not repe';
+                }
                 
                 return `
                     <tr>
                         <td>${num}</td>
-                        <td><span class="badge ${isRegistered ? 'bg-success' : 'bg-danger'}">${status}</span></td>
+                        <td><span class="badge ${status === 'Registered' || status === 'Repe' ? 'bg-success' : 'bg-danger'}">${status}</span></td>
                         <td>${details}</td>
                     </tr>
                 `;
@@ -1503,9 +1598,12 @@
                         'Authorization': `Bearer ${localStorage.getItem('token')}`
                     },
                     body: JSON.stringify({
-                        autoBackup,
-                        notifications,
-                        autoReconnect
+                        key: 'settings',
+                        value: {
+                            autoBackup,
+                            notifications,
+                            autoReconnect
+                        }
                     })
                 });
                 
@@ -1524,7 +1622,7 @@
         function logout() {
             localStorage.removeItem('token');
             localStorage.removeItem('userId');
-            window.location.href = '/login';
+            showLoginPage();
         }
         
         // Show notification
