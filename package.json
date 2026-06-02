@@ -1,7 +1,7 @@
 {
-  "name": "adi-fix-merah-webset-v12",
+  "name": "adi-fix-merah-v12-app",
   "version": "12.0.0",
-  "description": "ADI FIX MERAH WEBSET V12 FULL PREMIUM EDITION",
+  "description": "ADI FIX MERAH V12 - Full Real App Edition",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
